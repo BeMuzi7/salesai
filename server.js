@@ -10,13 +10,23 @@
 import Fastify from 'fastify';
 import WebSocket from '@fastify/websocket';
 import formBody from '@fastify/formbody';
+import cors from '@fastify/cors';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 import WebSocketWS from 'ws';
 
 dotenv.config();
 
-const fastify = Fastify();
+const fastify = Fastify({ logger: true });
+
+// Enable CORS with permissive config for dev
+await fastify.register(cors, {
+  origin: true, // Allow all origins (reflection)
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+});
+
 fastify.register(WebSocket);
 fastify.register(formBody);
 
@@ -28,10 +38,16 @@ fastify.get('/', async (request, reply) => {
   return { status: 'SalesVoice AI Server Running' };
 });
 
+// Explicit OPTIONS handler for preflight checks
+fastify.options('/*', async (request, reply) => {
+  return reply.send();
+});
+
 // 1. OUTBOUND CALL ENDPOINT (Called by Frontend)
 fastify.post('/outbound-call', async (request, reply) => {
   const { to, from, accountSid, authToken } = request.body;
   const host = request.headers.host;
+  // This URL is what Twilio will call back when the call connects
   const twimlUrl = `https://${host}/incoming-call`;
 
   console.log(`Initiating call to ${to}...`);
@@ -52,9 +68,15 @@ fastify.post('/outbound-call', async (request, reply) => {
       body: params
     });
     
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text);
+    }
+
     const data = await response.json();
     return data;
   } catch (error) {
+    request.log.error(error);
     return reply.code(500).send({ error: error.message });
   }
 });
@@ -82,44 +104,57 @@ fastify.register(async (fastify) => {
     let streamId = null;
 
     const startGemini = async () => {
-      session = await ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } } 
+      try {
+        session = await ai.live.connect({
+          model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } } 
+            },
+            systemInstruction: "You are Alex, a sales agent selling websites for $800. Be concise and professional.",
           },
-          systemInstruction: "You are Alex, a sales agent selling websites for $800. Be concise and professional.",
-        },
-        callbacks: {
-           onopen: () => console.log('Gemini Connected'),
-           onmessage: (msg) => {
-             if (msg.serverContent?.modelTurn?.parts?.[0]?.inlineData) {
-               const audioData = msg.serverContent.modelTurn.parts[0].inlineData.data;
-               if (streamId) {
-                 connection.socket.send(JSON.stringify({
-                   event: 'media',
-                   streamSid: streamId,
-                   media: { payload: audioData }
-                 }));
+          callbacks: {
+             onopen: () => console.log('Gemini Connected'),
+             onmessage: (msg) => {
+               if (msg.serverContent?.modelTurn?.parts?.[0]?.inlineData) {
+                 const audioData = msg.serverContent.modelTurn.parts[0].inlineData.data;
+                 if (streamId && connection.readyState === connection.OPEN) {
+                   connection.socket.send(JSON.stringify({
+                     event: 'media',
+                     streamSid: streamId,
+                     media: { payload: audioData }
+                   }));
+                 }
                }
              }
-           }
-        }
-      });
+          }
+        });
+      } catch (err) {
+        console.error("Gemini Connect Error:", err);
+      }
     };
 
     startGemini();
 
     connection.socket.on('message', async (message) => {
-      const msg = JSON.parse(message);
-      if (msg.event === 'start') {
-        streamId = msg.start.streamSid;
-      } else if (msg.event === 'media' && session) {
-           session.sendRealtimeInput({ 
-             media: { mimeType: 'audio/pcm;rate=8000', data: msg.media.payload } 
-           });
+      try {
+        const msg = JSON.parse(message);
+        if (msg.event === 'start') {
+          streamId = msg.start.streamSid;
+        } else if (msg.event === 'media' && session) {
+             session.sendRealtimeInput({ 
+               media: { mimeType: 'audio/pcm;rate=8000', data: msg.media.payload } 
+             });
+        }
+      } catch (e) {
+        console.error("Socket message error", e);
       }
+    });
+
+    connection.socket.on('close', () => {
+        console.log("Client disconnected");
+        // Clean up session if needed
     });
   });
 });
